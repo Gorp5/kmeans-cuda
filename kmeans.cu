@@ -123,12 +123,14 @@ void initCentroids(float* h_data, float* centroids, int num_data, int numCentroi
 __global__ void assignCentroid(ui* assignments, float* data, int num_vecs, float* centroids, ui k, int dim) {
     int data_id = blockIdx.x * blockDim.x + threadIdx.x;
 
+    if (data_id >= num_vecs) return;
+
     float min_distance = FLT_MAX;
     int min_k = -1;
 
     float* target_vector = data + data_id * dim;
 
-    if (data_id >= num_vecs) return;
+    
     for (int current_k = 0; current_k < k; current_k++) {
 
         // Distance Operation
@@ -144,7 +146,7 @@ __global__ void assignCentroid(ui* assignments, float* data, int num_vecs, float
         }
     }
 
-    assignments[data_id] = (ui)data + data_id * k;
+    assignments[data_id] = (ui)min_k;
 }
 
 __global__ void addAllAssignments(ui* assignments, float* assignment_sums, int* counts, float* data, int k, int dim, int num_vecs){
@@ -186,10 +188,48 @@ __global__ void divideSums(float* assignment_sums, int* counts, float* centroids
 
 
 }
+//Main kmeans function that calls the three kernels to run kmeans, updates the centroid and assignment values
+void kmeans(float* h_data, float* h_centroids, ui* h_assignments, int N, int k, int dim, int max_iterations){
+    float *d_data, *d_centroids, *d_sums;
+    int *d_counts;
+    ui *d_assignments;
 
-__global__ void kmeans(float* data, float* labels, float* centroids, ui* assignments, ){
+    cudaMalloc(&d_data, N * dim * sizeof(float));
+    cudaMalloc(&d_centroids, k * dim * sizeof(float));
+    cudaMalloc(&d_sums, k * dim * sizeof(float));
+    cudaMalloc(&d_assignments, N * sizeof(ui));
+    cudaMalloc(&d_counts, k * sizeof(int));
 
+    cudaMemcpy(d_data,      h_data,      N * dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_centroids, h_centroids, k * dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(d_assignments, 0, N * sizeof(ui));
 
+    int ThrPerBlk     = 256;
+    int blocksN = (N + ThrPerBlk - 1) / ThrPerBlk;
+    int blocksK = (k + ThrPerBlk - 1) / ThrPerBlk;
+
+    for(int i = 0; i < max_iterations; i++){
+
+        assignCentroid<<<blocksN, ThrPerBlk>>>(d_assignments, d_data, N,
+                                         d_centroids, (ui)k, dim);
+
+        cudaMemset(d_sums,   0, k * dim * sizeof(float));
+        cudaMemset(d_counts, 0, k       * sizeof(int));
+
+        addAllAssignments<<<blocksN, ThrPerBlk>>>(d_assignments, d_sums, d_counts,
+                                            d_data, k, dim, N);
+
+        divideSums<<<blocksK, ThrPerBlk>>>(d_sums, d_counts, d_centroids, k, dim);
+    }
+
+    cudaMemcpy(h_assignments, d_assignments, N * sizeof(ui), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_centroids, d_centroids, k * dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_data);
+    cudaFree(d_centroids);
+    cudaFree(d_sums);
+    cudaFree(d_assignments);
+    cudaFree(d_counts);
 }
 
 
@@ -197,7 +237,7 @@ int main() {
     int N, num_labels;
     int k        = 10;
     int dim      = 784;
-    int max_iter = 300;
+    int max_iterations = 300;
 
     // load
     float* h_data        = loadMNISTImages("train-images-idx3-ubyte", &N);
@@ -224,7 +264,18 @@ int main() {
         }
     }
 
+    printf("Running Kmeans now for %d iterations\n", max_iterations);
+    kmeans(h_data, h_centroids, h_assignments, N, k, dim, max_iterations);
 
+    int counts[10] = {};
+    for (int i = 0; i < N; i++){
+        counts[h_assignments[i]]++;
+    }
+    
+    printf("\ncluster sizes:\n");
+    for (int i = 0; i < k; i++){
+        printf("  cluster %d: %d points\n", i, counts[i]);
+    }
 
     free(h_data);
     free(h_labels);
