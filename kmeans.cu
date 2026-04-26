@@ -1,10 +1,78 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <float.h>
+#include <stdint.h>
 
 typedef unsigned char uch;
 typedef unsigned long ul;
 typedef unsigned int  ui;
+
+uint32_t flipBytes(uint32_t val) {
+    return ((val & 0xFF000000) >> 24) |
+           ((val & 0x00FF0000) >> 8)  |
+           ((val & 0x0000FF00) << 8)  |
+           ((val & 0x000000FF) << 24);
+}
+
+float* loadMNISTImages(const char* filepath, int* num_images) {
+    FILE* f = fopen(filepath, "rb");
+    if (!f) { fprintf(stderr, "could not open %s\n", filepath); return NULL; }
+
+    uint32_t magic, n_images, n_rows, n_cols;
+    fread(&magic,    sizeof(uint32_t), 1, f);
+    fread(&n_images, sizeof(uint32_t), 1, f);
+    fread(&n_rows,   sizeof(uint32_t), 1, f);
+    fread(&n_cols,   sizeof(uint32_t), 1, f);
+
+    magic    = flipBytes(magic);
+    n_images = flipBytes(n_images);
+    n_rows   = flipBytes(n_rows);
+    n_cols   = flipBytes(n_cols);
+
+    if (magic != 2051) { fprintf(stderr, "wrong magic number\n"); return NULL; }
+
+    int dim = n_rows * n_cols;
+    *num_images = (int)n_images;
+
+    uint8_t* raw  = (uint8_t*)malloc(n_images * dim);
+    fread(raw, sizeof(uint8_t), n_images * dim, f);
+    fclose(f);
+
+    float* data = (float*)malloc(n_images * dim * sizeof(float));
+    for (int i = 0; i < (int)(n_images * dim); i++)
+        data[i] = raw[i] / 255.0f;
+
+    free(raw);
+    return data;
+}
+
+int* loadMNISTLabels(const char* filepath, int* num_labels) {
+    FILE* f = fopen(filepath, "rb");
+    if (!f) { fprintf(stderr, "could not open %s\n", filepath); return NULL; }
+
+    uint32_t magic, n_labels;
+    fread(&magic,    sizeof(uint32_t), 1, f);
+    fread(&n_labels, sizeof(uint32_t), 1, f);
+
+    magic    = flipBytes(magic);
+    n_labels = flipBytes(n_labels);
+
+    if (magic != 2049) { fprintf(stderr, "wrong magic number\n"); return NULL; }
+
+    *num_labels = (int)n_labels;
+
+    uint8_t* raw = (uint8_t*)malloc(n_labels);
+    fread(raw, sizeof(uint8_t), n_labels, f);
+    fclose(f);
+
+    int* labels = (int*)malloc(n_labels * sizeof(int));
+    for (int i = 0; i < (int)n_labels; i++)
+        labels[i] = (int)raw[i];
+
+    free(raw);
+    return labels;
+}
+
 
 void initCentroids(float* h_data, float* centroids, int num_data, int numCentroids, int dim){
     float* distances = (float*)malloc(num_data * sizeof(float));
@@ -76,7 +144,7 @@ __global__ void assignCentroid(ui* assignments, float* data, int num_vecs, float
         }
     }
 
-    assignments[data_id] = data + data_id * k;
+    assignments[data_id] = (ui)data + data_id * k;
 }
 
 __global__ void addAllAssignments(ui* assignments, float* assignment_sums, int* counts, float* data, int k, int dim, int num_vecs){
@@ -113,41 +181,55 @@ __global__ void divideSums(float* assignment_sums, int* counts, float* centroids
     float* centroid_sum = assignment_sums + centroid_id * dim;
 
     for(int i = 0; i < dim; i++){
-        centroid_out[i] = centroid_sums[i]/(float)counts[centroid_id];
+        centroid_out[i] = centroid_sum[i]/(float)counts[centroid_id];
     }
+
+
+}
+
+__global__ void kmeans(float* data, float* labels, float* centroids, ui* assignments, ){
 
 
 }
 
 
 int main() {
-    int num_data = 1024;
-    int data_size = 128;
+    int N, num_labels;
+    int k        = 10;
+    int dim      = 784;
+    int max_iter = 300;
 
-    size_t total_size = num_data * data_size * sizeof(float);
+    // load
+    float* h_data        = loadMNISTImages("train-images-idx3-ubyte", &N);
+    int*   h_labels       = loadMNISTLabels("train-labels-idx1-ubyte", &num_labels);
+    float* h_centroids   = (float*)malloc(k * dim * sizeof(float));
+    ui*    h_assignments = (ui*)malloc(N * sizeof(ui));
 
-    float* h_data = (float*)malloc(total_size);
+    if (!h_data || !h_labels){
+        return 1;
+    }
 
-    float* d_data;
-    cudaMalloc(&d_data, total_size);
+    initCentroids(h_data, h_centroids, N, k, dim);
 
-    int threads = 256;
-    int blocks = (num_data + threads - 1) / threads;
+    //Check distances between Centroids after intialization
+    printf("\npairwise centroid distances:\n");
+    for (int i = 0; i < k; i++) {
+        for (int j = i + 1; j < k; j++) {
+            float dist = 0.0f;
+            for (int d = 0; d < dim; d++) {
+                float delta = h_centroids[i * dim + d] - h_centroids[j * dim + d];
+                dist += delta * delta;
+            }
+            printf("  centroid %d <-> centroid %d  dist²=%.2f\n", i, j, dist);
+        }
+    }
 
 
 
-    // Launch kernels
-    cudaMemcpy(d_data, h_data, total_size, cudaMemcpyHostToDevice);
-
-
-    assignCentroid<<<blocks, threads>>>(d_data, num_data, data_size);
-    findCentroid<<<blocks, threads>>>(d_data, num_data, data_size);
-
-
-    cudaMemcpy(h_data, d_data, total_size, cudaMemcpyDeviceToHost);
-
-    cudaFree(d_data);
     free(h_data);
+    free(h_labels);
+    free(h_centroids);
+    free(h_assignments);
 
     return 0;
 }
