@@ -73,6 +73,16 @@ int* loadMNISTLabels(const char* filepath, int* num_labels) {
     return labels;
 }
 
+void initCentroidsRandom(float* h_data, float* centroids, int num_data, int numCentroids, int dim) {
+    // Optional: seed RNG (do this once in main ideally)
+    srand(time(NULL));
+
+    for (int i = 0; i < numCentroids; i++) {
+        int idx = rand() % num_data;  // uniform random point
+        memcpy(centroids + i * dim, h_data + idx * dim, dim * sizeof(float));
+    }
+}
+
 
 void initCentroids(float* h_data, float* centroids, int num_data, int numCentroids, int dim){
     float* distances = (float*)malloc(num_data * sizeof(float));
@@ -120,7 +130,7 @@ void initCentroids(float* h_data, float* centroids, int num_data, int numCentroi
 
 // convert to using the nice cuda types later
 // Dot product optimization can be done using: ||x−c||^2 = ||x||^2 + ||c||^2 − 2(x * c)
-__global__ void assignCentroid(unsigned int* assignments, float* data, int num_vecs, float* centroids, int k, int data_size) {
+__global__ void assignCentroid(ui* assignments, float* data, int num_vecs, float* centroids, ui k, int dim) {
     int data_id = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (data_id >= num_vecs) return;
@@ -128,14 +138,15 @@ __global__ void assignCentroid(unsigned int* assignments, float* data, int num_v
     float min_distance = FLT_MAX;
     int min_k = -1;
 
-    float* target_vector = data + data_id * data_size;
+    float* target_vector = data + data_id * dim;
+
 
     for (int current_k = 0; current_k < k; current_k++) {
 
         // Distance Operation
         float running_sum = 0;
-        for (int current_dim = 0; current_dim < data_size; current_dim++) {
-            float distance = target_vector[current_dim] - centroids[current_k * data_size + current_dim];
+        for (int current_dim = 0; current_dim < dim; current_dim++) {
+            float distance = target_vector[current_dim] - centroids[current_k * dim + current_dim];
             running_sum += distance * distance;
         }
 
@@ -145,92 +156,125 @@ __global__ void assignCentroid(unsigned int* assignments, float* data, int num_v
         }
     }
 
-    assignments[data_id] = min_k;
+    assignments[data_id] = (ui)min_k;
 }
 
-__global__ void dotProductData(float* data, float* centroids, float* results, int num_vecs, int k, int data_size) {
-    int data_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int target_k = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (data_id >= num_vecs || target_k >= k) return;
-
-    const float* x = &data[data_id * data_size];
-    const float* c = &centroids[target_k * data_size];
-
-    float running_sum = 0;
-
-    for (int index = 0; index < data_size; index++) {
-        running_sum += x[index] * c[index];
-    }
-
-    results[data_id * k + target_k] = running_sum;
-}
-
-__global__ void dotProductCentroids(float* centroids, int k, int data_size, float* results) {
-    int target_k = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (target_k >= k) return;
-
-    const float* c = &centroids[target_k * data_size];
-
-    float running_sum = 0;
-
-    for (int index = 0; index < data_size; index++) {
-        running_sum += c[index] * c[index];
-    }
-
-    results[target_k] = running_sum;
-}
-
-__global__ void assignDotProduct(const float* dot_products, const float* norms, unsigned int* assignments, int num_vecs, int k) {
+__global__ void addAllAssignments(ui* assignments, float* assignment_sums, int* counts, float* data, int k, int dim, int num_vecs){
     int data_id = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (data_id >= num_vecs) return;
-
-    float best_score = FLT_MAX;
-    int best_k = -1;
-
-    for (int centroidIndex = 0; centroidIndex < k; centroidIndex++) {
-        float dot = dot_products[data_id * k + centroidIndex];
-
-        float score = norms[centroidIndex] - 2.0f * dot;
-
-        if (score < best_score) {
-            best_score = score;
-            best_k = centroidIndex;
-        }
+    if(data_id >= num_vecs){
+        return;
     }
 
-    assignments[data_id] = best_k;
+    int assigned_cen = (int)assignments[data_id];
+
+    float* data_vals = data + data_id * dim;
+
+    for(int i = 0; i < dim; i++){
+        atomicAdd(&assignment_sums[assigned_cen * dim + i], data_vals[i]);
+    }
+
+    atomicAdd(&counts[assigned_cen], 1);
 }
 
-__global__ void find_average_centroid(float* data, int num_vecs, int n) {
-    int data_id = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (data_id < num_vecs) {
-        float* target_vector = data + data_id * n;
+__global__ void divideSums(float* assignment_sums, int* counts, float* centroids, int k, int dim){
+    int centroid_id = blockIdx.x * blockDim.x + threadIdx.x;
 
-        // Assign each point to a centroid
+    if(centroid_id >= k){
+        return;
     }
+
+    if(counts[centroid_id] == 0){
+        return;
+    }
+
+    float* centroid_out = centroids + centroid_id * dim;
+    float* centroid_sum = assignment_sums + centroid_id * dim;
+
+    for(int i = 0; i < dim; i++){
+        centroid_out[i] = centroid_sum[i]/(float)counts[centroid_id];
+    }
+
+
+}
+//Main kmeans function that calls the three kernels to run kmeans, updates the centroid and assignment values
+void kmeans(float* h_data, float* h_centroids, ui* h_assignments, int N, int k, int dim, int max_iterations){
+    float *d_data, *d_centroids, *d_sums;
+    int *d_counts;
+    ui *d_assignments;
+
+    cudaMalloc(&d_data, N * dim * sizeof(float));
+    cudaMalloc(&d_centroids, k * dim * sizeof(float));
+    cudaMalloc(&d_sums, k * dim * sizeof(float));
+    cudaMalloc(&d_assignments, N * sizeof(ui));
+    cudaMalloc(&d_counts, k * sizeof(int));
+
+    cudaMemcpy(d_data,      h_data,      N * dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_centroids, h_centroids, k * dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(d_assignments, 0, N * sizeof(ui));
+
+    int ThrPerBlk     = 256;
+    int blocksN = (N + ThrPerBlk - 1) / ThrPerBlk;
+    int blocksK = (k + ThrPerBlk - 1) / ThrPerBlk;
+
+    for(int i = 0; i < max_iterations; i++){
+
+        assignCentroid<<<blocksN, ThrPerBlk>>>(d_assignments, d_data, N,
+                                         d_centroids, (ui)k, dim);
+
+        cudaMemset(d_sums,   0, k * dim * sizeof(float));
+        cudaMemset(d_counts, 0, k       * sizeof(int));
+
+        addAllAssignments<<<blocksN, ThrPerBlk>>>(d_assignments, d_sums, d_counts,
+                                            d_data, k, dim, N);
+
+        divideSums<<<blocksK, ThrPerBlk>>>(d_sums, d_counts, d_centroids, k, dim);
+    }
+
+    cudaMemcpy(h_assignments, d_assignments, N * sizeof(ui), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_centroids, d_centroids, k * dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_data);
+    cudaFree(d_centroids);
+    cudaFree(d_sums);
+    cudaFree(d_assignments);
+    cudaFree(d_counts);
+}
+
+// output CSV that contains image_id, true_label, cluster_id
+void saveAssignmentsCSV(const char* filepath, const ui* assignments,
+                        const int* labels, int N) {
+    FILE* f = fopen(filepath, "w");
+    if (!f) { fprintf(stderr, "could not write %s\n", filepath); return; }
+
+    fprintf(f, "image_id,true_label,cluster_id\n");
+    for (int i = 0; i < N; i++) {
+        fprintf(f, "%d,%d,%u\n", i, labels[i], assignments[i]);
+    }
+    fclose(f);
+    printf("  wrote assignments: %s (%d rows)\n", filepath, N);
 }
 
 int main() {
     int N, num_labels;
     int k        = 10;
-    int dim      = 784;
-    int max_iter = 300;
+    int rows     = 28;
+    int cols     = 28;
+    int dim      = rows * cols;
+    int max_iterations = 300;
 
     // load
     float* h_data        = loadMNISTImages("train-images-idx3-ubyte", &N);
     int*   h_labels       = loadMNISTLabels("train-labels-idx1-ubyte", &num_labels);
     float* h_centroids   = (float*)malloc(k * dim * sizeof(float));
-    unsigned int*    h_assignments = (unsigned int*)malloc(N * sizeof(unsigned int));
+    ui*    h_assignments = (ui*)malloc(N * sizeof(ui));
 
     if (!h_data || !h_labels){
         return 1;
     }
 
-    initCentroids(h_data, h_centroids, N, k, dim);
+    initCentroidsRandom(h_data, h_centroids, N, k, dim);
 
     //Check distances between Centroids after intialization
     printf("\npairwise centroid distances:\n");
@@ -245,72 +289,29 @@ int main() {
         }
     }
 
-    size_t total_size = N * dim * sizeof(float);
+    // snapshot the K-means++ starting points before the loop runs
 
-    float* gpu_data;
-    cudaMalloc(&gpu_data, total_size);
+    printf("\nRunning Kmeans now for %d iterations\n", max_iterations);
 
-    int centroid_products_size = sizeof(float) * k;
-    int dot_products_size = sizeof(float) * k * N;
-    int centroids_size = sizeof(float) * k * dim;
-    int assignments_size = sizeof(unsigned int) * N;
+    // time the entire kmeans() call with CUDA events
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0);
+    cudaEventCreate(&t1);
+    cudaEventRecord(t0);
 
-    float* gpu_centroid_products;
-    cudaMalloc(&gpu_centroid_products, centroid_products_size);
+    kmeans(h_data, h_centroids, h_assignments, N, k, dim, max_iterations);
 
-    float* gpu_dot_products;
-    cudaMalloc(&gpu_dot_products, dot_products_size);
-
-    float* gpu_centroids;
-    cudaMalloc(&gpu_centroids, centroids_size);
-
-    float* gpu_assignments;
-    cudaMalloc(&gpu_assignments, assignments_size);
-
-    // Launch kernels
-    cudaMemcpy(gpu_data, h_data, total_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(gpu_centroids, h_centroids, centroids_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(gpu_assignments, h_assignments, assignments_size, cudaMemcpyHostToDevice);
-
-    int threads = 256;
-    int blocks = (k + threads - 1) / threads;
-    dotProductCentroids<<<blocks, threads>>>(gpu_centroids, k, dim, gpu_centroid_products);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("Kernel launch error: %s\n", cudaGetErrorString(err));
+    int counts[10] = {};
+    for (int i = 0; i < N; i++){
+        counts[h_assignments[i]]++;
     }
-    cudaDeviceSynchronize();
 
-    dim3 blockDim(16, 16);
-    dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (k + blockDim.y - 1) / blockDim.y);
-    dotProductData<<<gridDim, blockDim>>>(gpu_data, gpu_centroids, gpu_dot_products, N, k, dim);
-
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("Kernel launch error: %s\n", cudaGetErrorString(err));
+    printf("\ncluster sizes:\n");
+    for (int i = 0; i < k; i++){
+        printf("  cluster %d: %d points\n", i, counts[i]);
     }
-    cudaDeviceSynchronize();
 
-    threads = 256;
-    blocks = (N + threads - 1) / threads;
-    assignDotProduct<<<blocks, threads>>>(gpu_dot_products, gpu_centroid_products, gpu_assignments, N, k);
-
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("Kernel launch error: %s\n", cudaGetErrorString(err));
-    }
-    cudaDeviceSynchronize();
-
-    cudaMemcpy(h_data, gpu_data, total_size, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_centroids, gpu_centroids, centroids_size, cudaMemcpyDeviceToHost);
-
-    cudaFree(gpu_data);
-    cudaFree(gpu_centroid_products);
-    cudaFree(gpu_dot_products);
-    cudaFree(gpu_centroids);
-    cudaFree(gpu_assignments);
-
+    saveAssignmentsCSV("assignments.csv", h_assignments, h_labels, N);
 
     free(h_data);
     free(h_labels);
